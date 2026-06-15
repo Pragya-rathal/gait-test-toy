@@ -1,0 +1,645 @@
+"""
+EMG -> NMF -> Synergy Activations -> Future Phase Prediction
+==============================================================
+
+Small-scale demonstration pipeline for gait EMG analysis.
+
+Expected input CSV columns:
+    emg_1 ... emg_11   : raw EMG channels
+    cycle_id           : integer/string identifier of the gait cycle
+    phase7             : gait phase label (1-7)
+    gait_percent       : 0-100, position within the gait cycle
+
+If DATA_PATH does not exist, a synthetic dataset with the same schema
+is generated automatically so the script can be run end-to-end.
+
+Sections:
+    A. Data loading
+    B. Preprocessing
+    C. NMF (synergy extraction)
+    D. Feature generation (H(t), dH/dt)
+    E. Baseline models (current-phase classification)
+    F. Forecasting models (future-phase prediction)
+    G. Evaluation
+    H. Visualization
+"""
+
+import os
+import warnings
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")  # headless plotting
+import matplotlib.pyplot as plt
+
+from scipy import signal
+from sklearn.decomposition import NMF
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.neural_network import MLPClassifier
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
+from sklearn.exceptions import ConvergenceWarning
+
+warnings.filterwarnings("ignore", category=ConvergenceWarning)
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+CONFIG = {
+    "data_path": "gait_emg_data.csv",          # replace with your CSV path
+    "fs": 2000,                                  # raw EMG sampling rate (Hz)
+    "emg_cols": [f"emg_{i}" for i in range(1, 12)],
+    "cycle_col": "cycle_id",
+    "phase_col": "phase7",
+    "gait_pct_col": "gait_percent",
+    "downsample_fs": 20,                         # envelope/feature sampling rate (Hz)
+    "bandpass": (20, 450),                       # Hz
+    "notch_freq": 50,                            # Hz
+    "notch_q": 30,
+    "envelope_cutoff": 6,                        # Hz
+    "filter_order": 4,
+    "nmf_range": range(2, 9),                    # synergies to test (2-8)
+    "vaf_threshold": 0.90,
+    "split_ratios": (0.70, 0.15, 0.15),          # train / val / test (by cycle_id)
+    "random_state": 42,
+    "forecast_horizons_ms": [50, 100, 200],
+    "output_dir": "outputs",
+}
+
+os.makedirs(CONFIG["output_dir"], exist_ok=True)
+
+
+# ============================================================
+# SECTION A: DATA LOADING
+# ============================================================
+def generate_synthetic_dataset(config, n_cycles=150, samples_per_cycle=2000,
+                                k_true=4, seed=42):
+    """
+    Generate a synthetic gait EMG dataset with the same schema as the
+    expected real dataset. Built from k_true ground-truth muscle
+    synergies (non-negative weight vectors x gaussian-bump activations),
+    modulated onto broadband carrier noise plus 50 Hz line noise and a
+    DC offset, to make all preprocessing steps meaningful.
+    """
+    rng = np.random.default_rng(seed)
+    fs = config["fs"]
+    n_channels = len(config["emg_cols"])
+    t = np.arange(samples_per_cycle) / fs
+    gait_pct = np.linspace(0, 100, samples_per_cycle, endpoint=False)
+
+    # Ground-truth synergy activation centers/widths (as % of gait cycle)
+    centers = np.array([10, 35, 60, 85])[:k_true]
+    widths = np.array([8, 10, 12, 9])[:k_true]
+
+    # Ground-truth, non-negative synergy weight vectors (channels x synergies)
+    W_true = rng.uniform(0.2, 1.0, size=(n_channels, k_true))
+
+    rows = []
+    for cycle in range(n_cycles):
+        jitter = rng.normal(0, 1.0, size=k_true)
+        H_cycle = np.zeros((k_true, samples_per_cycle))
+        for j in range(k_true):
+            c = centers[j] + jitter[j]
+            H_cycle[j] = np.exp(-0.5 * ((gait_pct - c) / widths[j]) ** 2) + 0.05
+
+        env_cycle = W_true @ H_cycle  # (channels, samples_per_cycle)
+
+        emg_cycle = np.zeros((samples_per_cycle, n_channels))
+        for ch in range(n_channels):
+            carrier = rng.normal(0, 1, samples_per_cycle)        # broadband interference
+            modulated = env_cycle[ch] * carrier                  # EMG-like burst pattern
+            line_noise = 0.02 * np.sin(2 * np.pi * 50 * t + rng.uniform(0, 2 * np.pi))
+            dc_offset = rng.normal(0, 0.05)
+            broadband_noise = rng.normal(0, 0.02, samples_per_cycle)
+            emg_cycle[:, ch] = modulated + line_noise + dc_offset + broadband_noise
+
+        phase7 = np.clip((gait_pct // (100.0 / 7.0)).astype(int), 0, 6) + 1
+
+        df_cycle = pd.DataFrame(emg_cycle, columns=config["emg_cols"])
+        df_cycle[config["cycle_col"]] = cycle
+        df_cycle[config["gait_pct_col"]] = gait_pct
+        df_cycle[config["phase_col"]] = phase7
+        rows.append(df_cycle)
+
+    return pd.concat(rows, ignore_index=True)
+
+
+def load_data(config):
+    """Load the gait EMG dataset from disk, or generate a synthetic demo set."""
+    if os.path.exists(config["data_path"]):
+        df = pd.read_csv(config["data_path"])
+        print(f"[A] Loaded dataset from {config['data_path']} "
+              f"({df.shape[0]} rows, {df[config['cycle_col']].nunique()} cycles)")
+    else:
+        print(f"[A] '{config['data_path']}' not found -> generating synthetic demo dataset")
+        df = generate_synthetic_dataset(config)
+        print(f"[A] Synthetic dataset generated "
+              f"({df.shape[0]} rows, {df[config['cycle_col']].nunique()} cycles)")
+    return df
+
+
+def split_by_cycle(df, config):
+    """Split a dataframe into train/val/test by unique cycle_id (no leakage)."""
+    cycle_col = config["cycle_col"]
+    unique_cycles = df[cycle_col].unique()
+
+    rng = np.random.default_rng(config["random_state"])
+    shuffled = rng.permutation(unique_cycles)
+
+    n = len(shuffled)
+    n_train = int(round(n * config["split_ratios"][0]))
+    n_val = int(round(n * config["split_ratios"][1]))
+
+    train_cycles = set(shuffled[:n_train])
+    val_cycles = set(shuffled[n_train:n_train + n_val])
+    test_cycles = set(shuffled[n_train + n_val:])
+
+    train_df = df[df[cycle_col].isin(train_cycles)].reset_index(drop=True)
+    val_df = df[df[cycle_col].isin(val_cycles)].reset_index(drop=True)
+    test_df = df[df[cycle_col].isin(test_cycles)].reset_index(drop=True)
+
+    print(f"[A] Split by cycle_id -> train: {len(train_cycles)} cycles, "
+          f"val: {len(val_cycles)} cycles, test: {len(test_cycles)} cycles")
+    return train_df, val_df, test_df
+
+
+# ============================================================
+# SECTION B: PREPROCESSING
+# ============================================================
+def remove_dc_offset(emg):
+    """Remove per-channel DC offset (mean subtraction)."""
+    return emg - np.mean(emg, axis=0, keepdims=True)
+
+
+def bandpass_filter(emg, fs, low, high, order):
+    """Zero-phase Butterworth bandpass filter."""
+    sos = signal.butter(order, [low, high], btype="bandpass", fs=fs, output="sos")
+    return signal.sosfiltfilt(sos, emg, axis=0)
+
+
+def notch_filter(emg, fs, freq, q):
+    """Zero-phase IIR notch filter (e.g. 50 Hz powerline)."""
+    b, a = signal.iirnotch(freq, q, fs)
+    return signal.filtfilt(b, a, emg, axis=0)
+
+
+def full_wave_rectify(emg):
+    """Full-wave rectification."""
+    return np.abs(emg)
+
+
+def lowpass_envelope(emg, fs, cutoff, order):
+    """Zero-phase Butterworth lowpass filter to obtain the linear envelope."""
+    sos = signal.butter(order, cutoff, btype="low", fs=fs, output="sos")
+    return signal.sosfiltfilt(sos, emg, axis=0)
+
+
+def preprocess_cycle_emg(emg_raw, fs, config):
+    """Apply the full preprocessing chain to one cycle's raw EMG (T x C)."""
+    x = remove_dc_offset(emg_raw)
+    x = bandpass_filter(x, fs, config["bandpass"][0], config["bandpass"][1], config["filter_order"])
+    x = notch_filter(x, fs, config["notch_freq"], config["notch_q"])
+    x = full_wave_rectify(x)
+    x = lowpass_envelope(x, fs, config["envelope_cutoff"], config["filter_order"])
+    return x
+
+
+def build_preprocessed_dataset(df, config):
+    """
+    Process every cycle through the full preprocessing chain, downsample
+    to config['downsample_fs'], and concatenate into one dataframe.
+
+    Returns:
+        processed_df : dataframe with processed (un-normalized) envelopes
+        example      : dict with one cycle's raw and processed signals for plotting
+    """
+    fs = config["fs"]
+    ds_fs = config["downsample_fs"]
+    factor = int(round(fs / ds_fs))
+    emg_cols = config["emg_cols"]
+
+    processed_frames = []
+    example = None
+
+    for cid, group in df.groupby(config["cycle_col"], sort=True):
+        emg_raw = group[emg_cols].values.astype(float)
+        emg_proc = preprocess_cycle_emg(emg_raw, fs, config)
+
+        if example is None:
+            example = {"cycle_id": cid, "raw": emg_raw.copy(),
+                        "processed": emg_proc.copy(), "fs": fs}
+
+        # Downsample envelope; lowpass cutoff (6 Hz) << new Nyquist, so safe.
+        emg_ds = emg_proc[::factor]
+        gait_pct_ds = group[config["gait_pct_col"]].values[::factor]
+        phase_ds = group[config["phase_col"]].values[::factor]
+
+        frame = pd.DataFrame(emg_ds, columns=emg_cols)
+        frame[config["cycle_col"]] = cid
+        frame[config["gait_pct_col"]] = gait_pct_ds
+        frame[config["phase_col"]] = phase_ds
+        frame["time_idx"] = np.arange(len(emg_ds))
+        processed_frames.append(frame)
+
+    processed_df = pd.concat(processed_frames, ignore_index=True)
+    print(f"[B] Preprocessing complete -> {len(processed_df)} samples "
+          f"at {ds_fs} Hz (from {fs} Hz raw)")
+    return processed_df, example
+
+
+def normalize_splits(train_df, val_df, test_df, emg_cols):
+    """Fit MinMax [0,1] scaler on train EMG envelopes only; apply to val/test."""
+    scaler = MinMaxScaler()
+    train_df = train_df.copy()
+    val_df = val_df.copy()
+    test_df = test_df.copy()
+
+    train_df[emg_cols] = np.clip(scaler.fit_transform(train_df[emg_cols].values), 0, 1)
+    val_df[emg_cols] = np.clip(scaler.transform(val_df[emg_cols].values), 0, 1)
+    test_df[emg_cols] = np.clip(scaler.transform(test_df[emg_cols].values), 0, 1)
+
+    print("[B] Normalized EMG envelopes to [0,1] (scaler fit on train only)")
+    return train_df, val_df, test_df, scaler
+
+
+# ============================================================
+# SECTION C: NMF (SYNERGY EXTRACTION)
+# ============================================================
+def compute_vaf(X, H_time, W_muscle):
+    """Global Variance Accounted For: VAF = 1 - ||X - H_time @ W_muscle||^2 / ||X||^2."""
+    X_hat = H_time @ W_muscle
+    ss_res = np.sum((X - X_hat) ** 2)
+    ss_tot = np.sum(X ** 2)
+    return 1.0 - ss_res / ss_tot
+
+
+def run_nmf_search(X_train, config):
+    """
+    Fit NMF for n_components in config['nmf_range'], compute VAF for each,
+    and select the smallest number of synergies reaching the VAF threshold.
+
+    Returns:
+        chosen_k    : selected number of synergies
+        nmf_model   : fitted NMF model for chosen_k
+        vaf_scores  : dict {k: vaf}
+    """
+    vaf_scores = {}
+    models = {}
+
+    for k in config["nmf_range"]:
+        nmf = NMF(n_components=k, init="nndsvda", max_iter=1000,
+                  random_state=config["random_state"])
+        H_time = nmf.fit_transform(X_train)   # activations over time (T x k)
+        W_muscle = nmf.components_            # synergy weight vectors (k x channels)
+        vaf = compute_vaf(X_train, H_time, W_muscle)
+        vaf_scores[k] = vaf
+        models[k] = nmf
+        print(f"[C] k={k}: VAF={vaf:.4f}")
+
+    chosen_k = None
+    for k in sorted(vaf_scores):
+        if vaf_scores[k] >= config["vaf_threshold"]:
+            chosen_k = k
+            break
+
+    if chosen_k is None:
+        chosen_k = max(vaf_scores)
+        print(f"[C] No k reached VAF >= {config['vaf_threshold']}; "
+              f"falling back to largest tested k={chosen_k}")
+    else:
+        print(f"[C] Selected k={chosen_k} synergies (VAF={vaf_scores[chosen_k]:.4f})")
+
+    return chosen_k, models[chosen_k], vaf_scores
+
+
+# ============================================================
+# SECTION D: FEATURE GENERATION (H(t), dH/dt)
+# ============================================================
+def extract_synergy_features(nmf_model, df, config):
+    """
+    Project EMG envelopes onto the fixed synergy weight vectors to obtain
+    H(t) (synergy activations), then compute dH/dt per cycle.
+
+    Returns:
+        feat_df  : df with added H{i} and dH{i}_dt columns
+        H_cols   : list of activation column names
+        dH_cols  : list of derivative column names
+    """
+    emg_cols = config["emg_cols"]
+    X = df[emg_cols].values
+
+    H_time = nmf_model.transform(X)  # (n_samples x k), components_ fixed from training
+    k = H_time.shape[1]
+    dt = 1.0 / config["downsample_fs"]
+
+    dHdt = np.zeros_like(H_time)
+    for cid in df[config["cycle_col"]].unique():
+        mask = (df[config["cycle_col"]] == cid).values
+        dHdt[mask, :] = np.gradient(H_time[mask, :], dt, axis=0)
+
+    H_cols = [f"H{i + 1}" for i in range(k)]
+    dH_cols = [f"dH{i + 1}_dt" for i in range(k)]
+
+    feat_df = df.copy()
+    for i, c in enumerate(H_cols):
+        feat_df[c] = H_time[:, i]
+    for i, c in enumerate(dH_cols):
+        feat_df[c] = dHdt[:, i]
+
+    return feat_df, H_cols, dH_cols
+
+
+# ============================================================
+# SECTION E: BASELINE MODELS (CURRENT-PHASE CLASSIFICATION)
+# ============================================================
+def train_random_forest(X_train, y_train, config):
+    """Baseline 1: Random Forest classifier."""
+    rf = RandomForestClassifier(
+        n_estimators=200, max_depth=None, n_jobs=-1,
+        random_state=config["random_state"]
+    )
+    rf.fit(X_train, y_train)
+    return rf
+
+
+def train_mlp(X_train, y_train, config, hidden_layer_sizes=(64, 32)):
+    """Baseline 2 / Proposed model: MLP classifier."""
+    mlp = MLPClassifier(
+        hidden_layer_sizes=hidden_layer_sizes, activation="relu",
+        solver="adam", max_iter=500, early_stopping=True,
+        random_state=config["random_state"]
+    )
+    mlp.fit(X_train, y_train)
+    return mlp
+
+
+# ============================================================
+# SECTION F: FORECASTING MODELS (FUTURE-PHASE PREDICTION)
+# ============================================================
+def create_future_labels(df, config, horizon_ms):
+    """
+    Build a future-phase target column by shifting phase7 forward by
+    horizon_ms within each cycle. Rows near the end of a cycle (where the
+    future sample does not exist) are marked invalid via the returned mask.
+    """
+    horizon_samples = max(1, round((horizon_ms / 1000.0) * config["downsample_fs"]))
+    df = df.copy()
+    future_col = f"phase7_future_{horizon_ms}ms"
+    df[future_col] = np.nan
+
+    for cid in df[config["cycle_col"]].unique():
+        idx = df.index[df[config["cycle_col"]] == cid]
+        labels = df.loc[idx, config["phase_col"]].values.astype(float)
+        future = np.full(len(labels), np.nan)
+        if horizon_samples < len(labels):
+            future[:-horizon_samples] = labels[horizon_samples:]
+        df.loc[idx, future_col] = future
+
+    valid_mask = df[future_col].notna().values
+    return df, future_col, valid_mask
+
+
+def train_forecast_model(X_train, y_train, config):
+    """Forecasting model: MLP on [H(t), dH/dt] -> future phase7."""
+    return train_mlp(X_train, y_train, config, hidden_layer_sizes=(64, 32))
+
+
+# ============================================================
+# SECTION G: EVALUATION
+# ============================================================
+def evaluate_classifier(model, X, y_true, label_order):
+    """Compute accuracy, macro F1, and confusion matrix for a fitted model."""
+    y_pred = model.predict(X)
+    acc = accuracy_score(y_true, y_pred)
+    f1_macro = f1_score(y_true, y_pred, average="macro", labels=label_order)
+    cm = confusion_matrix(y_true, y_pred, labels=label_order)
+    return {"accuracy": acc, "macro_f1": f1_macro, "confusion_matrix": cm, "labels": label_order}
+
+
+def print_results(title, results):
+    print(f"\n=== {title} ===")
+    for name, res in results.items():
+        print(f"{name:>20s}: accuracy={res['accuracy']:.4f}  macro_f1={res['macro_f1']:.4f}")
+
+
+# ============================================================
+# SECTION H: VISUALIZATION
+# ============================================================
+def plot_raw_vs_processed(example, config, save_path):
+    """Raw vs processed (envelope) EMG for channel 1 of one example cycle."""
+    fs = example["fs"]
+    raw = example["raw"][:, 0]
+    proc = example["processed"][:, 0]
+    t = np.arange(len(raw)) / fs
+
+    fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
+    axes[0].plot(t, raw, color="gray", linewidth=0.6)
+    axes[0].set_title(f"Raw EMG - {config['emg_cols'][0]} (cycle {example['cycle_id']})")
+    axes[0].set_ylabel("Amplitude")
+
+    axes[1].plot(t, proc, color="C0")
+    axes[1].set_title("Processed Envelope (bandpass + notch + rectify + lowpass)")
+    axes[1].set_xlabel("Time (s)")
+    axes[1].set_ylabel("Amplitude")
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150)
+    plt.close(fig)
+
+
+def plot_vaf_curve(vaf_scores, chosen_k, threshold, save_path):
+    """VAF vs number of synergies, with threshold and chosen k highlighted."""
+    ks = sorted(vaf_scores.keys())
+    vafs = [vaf_scores[k] for k in ks]
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.plot(ks, vafs, "o-", color="C0", label="VAF")
+    ax.axhline(threshold, color="r", linestyle="--", label=f"Threshold ({threshold:.2f})")
+    ax.axvline(chosen_k, color="g", linestyle=":", label=f"Chosen k={chosen_k}")
+    ax.set_xlabel("Number of synergies (k)")
+    ax.set_ylabel("VAF")
+    ax.set_title("VAF vs Number of Synergies")
+    ax.set_xticks(ks)
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150)
+    plt.close(fig)
+
+
+def plot_synergy_weights(W_muscle, emg_cols, save_path):
+    """Bar plot of each synergy's muscle weight vector."""
+    k, n_ch = W_muscle.shape
+    fig, axes = plt.subplots(1, k, figsize=(2.5 * k, 4), sharey=True)
+    if k == 1:
+        axes = [axes]
+
+    for i in range(k):
+        axes[i].bar(range(n_ch), W_muscle[i], color="C0")
+        axes[i].set_title(f"Synergy {i + 1}")
+        axes[i].set_xticks(range(n_ch))
+        axes[i].set_xticklabels(emg_cols, rotation=90, fontsize=7)
+
+    axes[0].set_ylabel("Weight")
+    fig.suptitle("Synergy Weight Vectors (Muscle Contributions)")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150)
+    plt.close(fig)
+
+
+def plot_synergy_activations(feat_df, H_cols, config, save_path, cycle_id=None):
+    """Plot H(t) (synergy activations) over one gait cycle."""
+    if cycle_id is None:
+        cycle_id = feat_df[config["cycle_col"]].iloc[0]
+
+    sub = feat_df[feat_df[config["cycle_col"]] == cycle_id].sort_values("time_idx")
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    for c in H_cols:
+        ax.plot(sub[config["gait_pct_col"]], sub[c], label=c)
+    ax.set_xlabel("Gait (%)")
+    ax.set_ylabel("Activation")
+    ax.set_title(f"Synergy Activations H(t) - Cycle {cycle_id}")
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150)
+    plt.close(fig)
+
+
+def plot_confusion_matrix(cm, labels, title, save_path):
+    """Heatmap-style confusion matrix with annotated counts."""
+    fig, ax = plt.subplots(figsize=(5, 4.5))
+    im = ax.imshow(cm, cmap="Blues")
+    ax.set_xticks(range(len(labels)))
+    ax.set_yticks(range(len(labels)))
+    ax.set_xticklabels(labels)
+    ax.set_yticklabels(labels)
+    ax.set_xlabel("Predicted phase")
+    ax.set_ylabel("True phase")
+    ax.set_title(title)
+
+    thresh = cm.max() / 2 if cm.max() > 0 else 0.5
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            ax.text(j, i, cm[i, j], ha="center", va="center",
+                    color="white" if cm[i, j] > thresh else "black", fontsize=8)
+
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150)
+    plt.close(fig)
+
+
+# ============================================================
+# MAIN PIPELINE
+# ============================================================
+def main():
+    config = CONFIG
+    out_dir = config["output_dir"]
+
+    # ---------------- A. Data loading ----------------
+    df_raw = load_data(config)
+
+    # ---------------- B. Preprocessing ----------------
+    processed_df, example = build_preprocessed_dataset(df_raw, config)
+    train_df, val_df, test_df = split_by_cycle(processed_df, config)
+    train_df, val_df, test_df, scaler = normalize_splits(
+        train_df, val_df, test_df, config["emg_cols"]
+    )
+
+    plot_raw_vs_processed(example, config, os.path.join(out_dir, "raw_vs_processed.png"))
+
+    # ---------------- C. NMF (synergy extraction) ----------------
+    X_train_emg = train_df[config["emg_cols"]].values
+    chosen_k, nmf_model, vaf_scores = run_nmf_search(X_train_emg, config)
+
+    plot_vaf_curve(vaf_scores, chosen_k, config["vaf_threshold"],
+                    os.path.join(out_dir, "vaf_vs_k.png"))
+
+    W_muscle = nmf_model.components_
+    plot_synergy_weights(W_muscle, config["emg_cols"],
+                          os.path.join(out_dir, "synergy_weights.png"))
+
+    # ---------------- D. Feature generation ----------------
+    train_feat, H_cols, dH_cols = extract_synergy_features(nmf_model, train_df, config)
+    val_feat, _, _ = extract_synergy_features(nmf_model, val_df, config)
+    test_feat, _, _ = extract_synergy_features(nmf_model, test_df, config)
+
+    plot_synergy_activations(train_feat, H_cols, config,
+                              os.path.join(out_dir, "synergy_activations.png"))
+
+    proposed_cols = H_cols + dH_cols
+    print(f"[D] Proposed feature set: {proposed_cols}")
+
+    # ---------------- E. Baseline models (current phase) ----------------
+    emg_cols = config["emg_cols"]
+    phase_col = config["phase_col"]
+    label_order = sorted(processed_df[phase_col].unique())
+
+    X_train_raw = train_df[emg_cols].values
+    X_val_raw = val_df[emg_cols].values
+    X_test_raw = test_df[emg_cols].values
+
+    y_train = train_df[phase_col].values
+    y_val = val_df[phase_col].values
+    y_test = test_df[phase_col].values
+
+    X_train_prop = train_feat[proposed_cols].values
+    X_val_prop = val_feat[proposed_cols].values
+    X_test_prop = test_feat[proposed_cols].values
+
+    print("\n[E] Training current-phase models...")
+    rf_model = train_random_forest(X_train_raw, y_train, config)
+    mlp_raw_model = train_mlp(X_train_raw, y_train, config)
+    mlp_prop_model = train_mlp(X_train_prop, y_train, config)
+
+    current_results = {
+        "baseline1_rf_raw": evaluate_classifier(rf_model, X_test_raw, y_test, label_order),
+        "baseline2_mlp_raw": evaluate_classifier(mlp_raw_model, X_test_raw, y_test, label_order),
+        "proposed_mlp_H_dH": evaluate_classifier(mlp_prop_model, X_test_prop, y_test, label_order),
+    }
+
+    # ---------------- G. Evaluation (current phase) ----------------
+    print_results("Current-Phase Classification (Test Set)", current_results)
+
+    # ---------------- H. Confusion matrices (current phase) ----------------
+    for name, res in current_results.items():
+        plot_confusion_matrix(
+            res["confusion_matrix"], res["labels"],
+            f"{name} - Confusion Matrix",
+            os.path.join(out_dir, f"cm_{name}.png")
+        )
+
+    # ---------------- F. Forecasting models (future phase) ----------------
+    print("\n[F] Training future-phase forecasting models...")
+    forecast_results = {}
+    for h in config["forecast_horizons_ms"]:
+        tr_f, future_col, mask_tr = create_future_labels(train_feat, config, h)
+        te_f, _, mask_te = create_future_labels(test_feat, config, h)
+
+        tr_f = tr_f[mask_tr]
+        te_f = te_f[mask_te]
+
+        Xtr = tr_f[proposed_cols].values
+        ytr = tr_f[future_col].values.astype(int)
+        Xte = te_f[proposed_cols].values
+        yte = te_f[future_col].values.astype(int)
+
+        model_h = train_forecast_model(Xtr, ytr, config)
+        res = evaluate_classifier(model_h, Xte, yte, label_order)
+        forecast_results[f"+{h}ms"] = res
+
+        plot_confusion_matrix(
+            res["confusion_matrix"], res["labels"],
+            f"Forecast +{h}ms - Confusion Matrix",
+            os.path.join(out_dir, f"cm_forecast_{h}ms.png")
+        )
+
+    # ---------------- G. Evaluation (forecasting) ----------------
+    print_results("Future-Phase Prediction (Test Set)", forecast_results)
+
+    print(f"\nAll plots saved to: {os.path.abspath(out_dir)}/")
+
+
+if __name__ == "__main__":
+    main()
